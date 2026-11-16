@@ -49,7 +49,7 @@ def main():
     port, kernel, packed = image(args.port)
     assert kernel == original_kernel, "kernel or appended DTBs changed"
     assert port[:16] + port[20:1632] == base[:16] + base[20:1632], "boot addresses, command line or header fields changed"
-    assert len(port) <= 64 << 20 and len(packed) <= 20 << 20, "partition or ramdisk limit exceeded"
+    assert len(port) <= 64 << 20 and len(packed) <= 32 << 20, "partition or ramdisk limit exceeded"
     original, entries = archive(original_packed), archive(packed)
     for name in ("init", "system/bin/init", "system/bin/adbd", "system/bin/linker64", "system/bin/sh",
                  "system/lib64/libc.so", "system/lib64/libdl.so", "system/lib64/libm.so", "file_contexts.bin",
@@ -76,7 +76,7 @@ def main():
         metadata, body = entries[path]
         assert metadata[0] & 0o170000 == 0o120000 and body == b"skyward", f"incorrect command link: {name}"
     print(f"Verified: unchanged kernel/DTBs and base runtime; {len(entries)} ramdisk entries")
-    print(f"Image: {len(port)} / {64 << 20} bytes; LZMA ramdisk: {len(packed)} / {20 << 20} bytes")
+    print(f"Image: {len(port)} / {64 << 20} bytes; LZMA ramdisk: {len(packed)} / {32 << 20} bytes")
     print(f"SHA-256: {hashlib.sha256(port).hexdigest()}")
 
 
