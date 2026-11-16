@@ -2,6 +2,7 @@
 """Check a packed port against its base without accessing a phone."""
 
 import argparse
+import gzip
 import hashlib
 import lzma
 import struct
@@ -20,7 +21,14 @@ def image(path):
 
 
 def archive(packed):
-    data = lzma.decompress(packed, format=lzma.FORMAT_ALONE)
+    if packed[:2] == b"\x1f\x8b":
+        data = gzip.decompress(packed)
+    elif packed[:6] == b"\xfd7zXZ\x00":
+        data = lzma.decompress(packed, format=lzma.FORMAT_XZ)
+    elif packed[:1] == b"\x5d":
+        data = lzma.decompress(packed, format=lzma.FORMAT_ALONE)
+    else:
+        raise ValueError(f"unsupported ramdisk compression magic: {packed[:6].hex()}")
     entries = {}
     pos = 0
     while data[pos:pos + 6] in (b"070701", b"070702"):
@@ -76,7 +84,7 @@ def main():
         metadata, body = entries[path]
         assert metadata[0] & 0o170000 == 0o120000 and body == b"skyward", f"incorrect command link: {name}"
     print(f"Verified: unchanged kernel/DTBs and base runtime; {len(entries)} ramdisk entries")
-    print(f"Image: {len(port)} / {64 << 20} bytes; LZMA ramdisk: {len(packed)} / {32 << 20} bytes")
+    print(f"Image: {len(port)} / {64 << 20} bytes; Ramdisk: {len(packed)} / {32 << 20} bytes")
     print(f"SHA-256: {hashlib.sha256(port).hexdigest()}")
 
 
