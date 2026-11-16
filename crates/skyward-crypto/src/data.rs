@@ -1,0 +1,948 @@
+//! Opening the data partition. A phone encrypts the whole of it with a key
+//! its storage hardware holds, and encrypts each user's files again with a
+//! key only that user's credential leads to. This is the first of the two:
+//! what it opens holds every file, with the names and contents of the ones
+//! that are a user's own still encrypted.
+
+use crate::gatekeeper::Gatekeeper;
+use crate::keymint::KeyMint;
+use crate::keystore::{StoredKey, Unwrap};
+use crate::token::Token;
+use crate::user::Bound;
+use crate::weaver::Weaver;
+use anyhow::{Context, Result};
+use skyward_binder::driver::Binder;
+use skyward_block::dm::Target;
+use skyward_block::fsck::Checked;
+use skyward_block::fstab::Entry;
+use skyward_block::{dm, mount};
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+
+/// Where the data partition is mounted, and the name its decrypted form is
+/// given among the device-mapper's devices.
+pub const MOUNT: &str = "/data";
+pub const MAPPED: &str = "userdata";
+
+/// Where the phone keeps the files its users share between apps, a folder
+/// for each user, and where the recovery shows the owner's, the way the
+/// phone shows them to apps.
+pub const SHARED_STORAGE: &str = "/data/media";
+pub const SDCARD: &str = "/sdcard";
+
+/// The phone's owner, the first of its users.
+const OWNER: u32 = 0;
+
+/// The key is in a directory of this name under the one the phone names.
+const KEY_DIR: &str = "key";
+
+/// How the kernel knows the cipher a phone names.
+const CIPHERS: [(&str, &str); 2] = [("aes-256-xts", "aes-xts-plain64"), ("adiantum", "xchacha12,aes-adiantum-plain64")];
+
+/// The hardware reads and writes in 4096-byte units, so the partition is
+/// mapped in whole multiples of eight 512-byte sectors.
+const SECTORS_PER_UNIT: u64 = 8;
+
+/// How a phone says its data partition is encrypted: the cipher, and
+/// whether the key is one only the storage hardware can unwrap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Encryption {
+    pub cipher: String,
+    pub wrapped: bool,
+}
+
+impl Encryption {
+    /// Read what an entry of the phone's own table says.
+    pub fn of(entry: &Entry) -> Result<Encryption> {
+        let said = entry.extra("metadata_encryption").context("the phone says its data partition is not encrypted whole")?;
+        let (name, rest) = said.split_once(':').unwrap_or((said, ""));
+        let cipher = CIPHERS
+            .iter()
+            .find_map(|(theirs, kernels)| (*theirs == name).then_some(*kernels))
+            .with_context(|| format!("no cipher here is the {name} the phone names"))?;
+        Ok(Encryption { cipher: cipher.to_string(), wrapped: rest == "wrappedkey_v0" })
+    }
+}
+
+/// Where the phone keeps the key for the filesystem an entry describes.
+pub fn key_dir(entry: &Entry) -> Result<PathBuf> {
+    let dir = entry.extra("keydirectory").context("the phone says where the key for its data partition is not")?;
+    Ok(Path::new(dir).join(KEY_DIR))
+}
+
+/// Unwrap the key the phone keeps for its data partition and give the
+/// storage hardware the form of it that lasts until the phone is started
+/// again.
+pub fn storage_key(service: &KeyMint, entry: &Entry, encryption: &Encryption) -> Result<Vec<u8>> {
+    hardware_key(service, &key_dir(entry)?, encryption.wrapped)
+}
+
+/// The key a directory holds, in the form the storage hardware takes for
+/// this start of the phone. A key the hardware holds never appears as
+/// itself: what comes back is wrapped again, for this start only.
+fn hardware_key(service: &KeyMint, dir: &Path, wrapped: bool) -> Result<Vec<u8>> {
+    let stored = StoredKey::load(dir).with_context(|| format!("read the key in {}", dir.display()))?;
+    let key = stored.unwrap(Unwrap::Hardware(service)).with_context(|| format!("unwrap the key in {}", dir.display()))?;
+    match wrapped {
+        true => service.ephemeral_storage_key(&key).with_context(|| format!("make the key in {} usable now", dir.display())),
+        false => Ok(key),
+    }
+}
+
+/// The data partition as [`open`] leaves it.
+pub struct Opened {
+    /// The device the partition is read and written through, decrypted.
+    pub mapped: PathBuf,
+    pub filesystem: String,
+    /// How the check before mounting ended, where the phone's table asks
+    /// for one.
+    pub checked: Option<Checked>,
+}
+
+/// Open the phone's data partition: unwrap the key it is encrypted with,
+/// give that to the storage hardware, check the filesystem where the
+/// phone's table asks for it, and mount it writable, as the phone mounts
+/// it. The names and contents of each user's own files stay encrypted
+/// until that user's key is let in as well. A partition that does not
+/// mount leaves no device behind.
+fn open(service: &KeyMint) -> Result<Opened> {
+    let (entries, mapped) = map(service)?;
+    let mounted = (|| -> Result<(Option<Checked>, String)> {
+        // A phone that names the partition once per filesystem it might
+        // hold mounts it with the entry of the one it holds.
+        let holds = skyward_block::probe::filesystem(&mapped)?;
+        let entry = entries.iter().find(|e| holds.as_ref() == Some(&e.filesystem)).unwrap_or(&entries[0]);
+        let checked = match entry.extras.iter().any(|e| e == "check") {
+            true => Some(skyward_block::fsck::check(&mapped, &entry.filesystem)?),
+            false => None,
+        };
+        std::fs::create_dir_all(MOUNT).with_context(|| format!("make {MOUNT}"))?;
+        mount::mount(&mapped, Path::new(MOUNT), &entry.filesystem, &entry.options)?;
+        Ok((checked, entry.filesystem.clone()))
+    })();
+    match mounted {
+        Ok((checked, filesystem)) => Ok(Opened { mapped, filesystem, checked }),
+        Err(e) => match dm::remove(MAPPED) {
+            Ok(()) => Err(e),
+            Err(r) => Err(e.context(format!("removing {MAPPED} afterwards failed too: {r:#}"))),
+        },
+    }
+}
+
+/// Map the data partition decrypted, under the key the phone keeps for it,
+/// and give its table's entries, the first the one the key is found by,
+/// and the device the filesystem is read and written through.
+fn map(service: &KeyMint) -> Result<(Vec<Entry>, PathBuf)> {
+    let entries = skyward_block::fstab::read(MOUNT)?;
+    let entry = entries.first().with_context(|| format!("the phone's own table says nothing about {MOUNT}"))?;
+    let encryption = Encryption::of(entry)?;
+    let device = skyward_block::fstab::device(entry)?;
+    let key = storage_key(service, entry, &encryption)?;
+    let sectors = skyward_block::size_bytes(&device)? / 512;
+    let mapped = dm::create(MAPPED, &[target(&device, sectors, &key, &encryption)], false)?;
+    Ok((entries, mapped))
+}
+
+/// Map the data partition decrypted without mounting it, for its
+/// filesystem to be repaired, and give the device it is reached through;
+/// [`unmap`] takes it away again. The partition is to be closed.
+pub fn map_unmounted(service: &KeyMint) -> Result<PathBuf> {
+    anyhow::ensure!(dm::status(MAPPED)?.is_none(), "the data partition is open");
+    map(service).map(|(_, mapped)| mapped)
+}
+
+/// Take away the mapping [`map_unmounted`] made.
+pub fn unmap() -> Result<()> {
+    dm::remove(MAPPED)
+}
+
+/// Show the owner's shared storage at /sdcard; shown already, it stays.
+/// Android keeps the files of each user in a folder of their own under the
+/// shared storage, and a phone whose recovery you can read files from often
+/// keeps them straight in that parent instead — measured on one, the folder
+/// for the owner is absent while its parent holds everything the user sees.
+/// And where there is nothing to show at all, that is told and the data stays
+/// open: a recovery that will not work on a partition it has open, because a
+/// friendly link is missing, is worse than one with no /sdcard.
+/// Where the phone keeps what its users see as internal storage: the owner
+/// user's folder, where its system has made one, and the place those
+/// folders live in where it has not -- a data partition made afresh that has
+/// never started its system has neither yet, which is `None` here.
+pub fn shared_storage() -> Option<PathBuf> {
+    let owner = Path::new(SHARED_STORAGE).join(OWNER.to_string());
+    if owner.is_dir() {
+        return Some(owner);
+    }
+    Path::new(SHARED_STORAGE).is_dir().then(|| PathBuf::from(SHARED_STORAGE))
+}
+
+/// The account a phone's own system keeps its users' shared files under:
+/// `AID_MEDIA_RW` in Android's `android_filesystem_config.h`, which is what
+/// `/data/media` and `/data/media/0` are owned by on a started phone -- read
+/// off this one once they existed.
+const MEDIA_RW: u32 = 1023;
+
+/// Make the owner's shared storage as its system would have made it. A data
+/// partition that has never started a system holds no `/data/media` at all,
+/// and a recovery with nowhere to show a computer, store a backup, or put a
+/// file is worse than one that makes the two folders and gives them the
+/// owner and the mode the system's own `mkdir` gives them -- which corrects
+/// the owner and mode of a directory it finds anyway, so nothing here can
+/// leave the phone different from one that simply booted first.
+fn make_shared_storage() -> Result<PathBuf> {
+    let owner = Path::new(SHARED_STORAGE).join(OWNER.to_string());
+    for at in [Path::new(SHARED_STORAGE), owner.as_path()] {
+        std::fs::create_dir_all(at).with_context(|| format!("make {}", at.display()))?;
+        std::os::unix::fs::chown(at, Some(MEDIA_RW), Some(MEDIA_RW)).with_context(|| format!("give {} to the media account", at.display()))?;
+        std::fs::set_permissions(at, std::fs::Permissions::from_mode(0o770)).with_context(|| format!("set the mode of {}", at.display()))?;
+    }
+    eprintln!("the data partition held no shared storage: made {} as its system would", owner.display());
+    Ok(owner)
+}
+
+fn show_owner_storage() -> Result<()> {
+    let at = Path::new(SDCARD);
+    if mount::is_mount_point(at)? {
+        return Ok(());
+    }
+    let from = match shared_storage() {
+        Some(from) => from,
+        None => make_shared_storage()?,
+    };
+    mount::bind(&from, at)
+}
+
+/// Close what opening the partition opened, where the recovery opened it:
+/// /sdcard, the partition's mount, and the device it is read through.
+pub fn close() -> Result<()> {
+    for at in [SDCARD, MOUNT] {
+        if mount::is_mount_point(Path::new(at))? {
+            mount::umount(Path::new(at))?;
+        }
+    }
+    if dm::status(MAPPED)?.is_some() {
+        dm::remove(MAPPED)?;
+    }
+    Ok(())
+}
+
+/// A user whose own files are still closed: who, the kind of screen lock
+/// they set in the phone's numbering, and whether the phone made their
+/// credential up, in which case they open behind the owner and nobody is
+/// asked for it. `why` says why such a user did not open behind the owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Closed {
+    pub user: u32,
+    pub lock: i32,
+    pub made_up: bool,
+    pub why: Option<String>,
+}
+
+/// The data partition as far as it opens with nothing a user knows.
+pub struct Opening {
+    /// How it was mounted, where this mounted it rather than an earlier
+    /// run of the recovery.
+    pub mounted: Option<Opened>,
+    /// The users whose own files are still closed, the owner first.
+    pub closed: Vec<Closed>,
+}
+
+/// Open the data partition where it is reached without any key at all.
+///
+/// The recovery's other way round asks the phone's key service to unwrap
+/// the storage key, which is right for a phone whose data is encrypted and
+/// is a wait that never ends on one whose data is not: with nothing to hold
+/// the key, the service the table names is a service the phone never had,
+/// and the binder call for it is answered by nobody.
+///
+/// **Whether the partition can be opened is asked of the mount itself.** A
+/// table's `fileencryption=` is the system's plan for a partition it has yet
+/// to open, not a fact about the one in hand, and a phone whose data was
+/// made afresh as another filesystem keeps every word of that plan while
+/// holding nothing that needs a key — which is how this recovery came to
+/// answer "the table gives /data as ext4 a fileencryption" for a partition
+/// that mounts as plain ext4. So the line the partition's own superblock
+/// names is tried first, then the rest of the table's lines in order, and
+/// the first that mounts is the one the phone has. A phone that really does
+/// keep keys is caught afterwards, by the markers Android leaves in the
+/// files, and the mount made here is taken back before giving up.
+pub fn open_without_keys() -> Result<Opening> {
+    let entries = skyward_block::fstab::read(MOUNT)?;
+    let mounted = match mount::is_mount_point(Path::new(MOUNT))? {
+        true => None,
+        false => {
+            let device = skyward_block::fstab::device(entries.first().with_context(|| format!("the phone's own table says nothing about {MOUNT}"))?)?;
+            std::fs::create_dir_all(MOUNT).with_context(|| format!("make {MOUNT}"))?;
+            // The filesystem the partition's own superblock names goes
+            // first, and the sort is stable, so the rest keep the table's
+            // order. A partition whose superblock names nothing known is
+            // simply tried against every line.
+            let holds = skyward_block::probe::filesystem(Path::new(&device)).ok().flatten();
+            let mut order: Vec<&Entry> = entries.iter().collect();
+            order.sort_by_key(|e| holds.as_ref() != Some(&e.filesystem));
+            let mut why: Vec<String> = Vec::new();
+            let mut open = None;
+            for entry in order {
+                match mount::mount(Path::new(&device), Path::new(MOUNT), &entry.filesystem, &entry.options) {
+                    Ok(()) => {
+                        open = Some(entry);
+                        break;
+                    }
+                    Err(e) => why.push(format!("as {}: {e:#}", entry.filesystem)),
+                }
+            }
+            let Some(entry) = open else {
+                anyhow::bail!("{device} would not mount: {}", why.join("; "));
+            };
+            Some(Opened { mapped: PathBuf::from(device), filesystem: entry.filesystem.clone(), checked: None })
+        }
+    };
+    // Android leaves word of its own keys in these places: the staging folder
+    // a file-based-encrypted phone keeps, and the per-user keys vold holds.
+    // A phone that has them is one whose data this is not the way to reach,
+    // whatever its table said; the mount made here is taken back before
+    // giving up. `/data/misc/vold` itself is **not** one of them — every
+    // Android data partition has that folder, and on a phone that keeps no
+    // keys it is simply empty, which is what this phone's is: reading the
+    // folder as the marker refused a data partition that mounts and reads
+    // perfectly well, with "the phone does keep keys for it".
+    for marker in ["/data/unencrypted", "/data/misc/vold/user_keys"] {
+        if Path::new(marker).exists() {
+            if mounted.is_some() {
+                let _ = mount::umount(Path::new(MOUNT));
+            }
+            anyhow::bail!("{marker} is there, so the phone does keep keys for it");
+        }
+    }
+    show_owner_storage()?;
+    Ok(Opening { mounted, closed: Vec::new() })
+}
+
+/// Open the data partition as far as it opens with nothing a user knows:
+/// mount it where it is not mounted, let in the keys of the files that
+/// belong to no one user and of each user's files readable before they
+/// sign in, and open the own files of every user who set no screen lock
+/// and, behind the owner's, of those whose credential the phone made up.
+pub fn open_without_credential(service: &KeyMint) -> Result<Opening> {
+    let entries = skyward_block::fstab::read(MOUNT)?;
+    // Whether the partition is encrypted **whole** is what decides how it is
+    // opened. A phone that keeps its key in /metadata has the whole thing
+    // wrapped in one, and it is mapped through the storage hardware; one
+    // that encrypts its files one by one -- this phone, whose table says
+    // `fileencryption=ice` and nothing about metadata -- is mounted as it
+    // is, and the keys for the files are let in below.
+    let whole = entries.iter().any(|e| e.extra("metadata_encryption").is_some());
+    let mounted = match (mount::is_mount_point(Path::new(MOUNT))?, whole) {
+        (true, _) => None,
+        (false, true) => Some(open(service)?),
+        (false, false) => {
+            mount_plainly(&entries)?;
+            None
+        }
+    };
+    open_shared(service)?;
+    let mut closed = Vec::new();
+    let mut owner = Note::default();
+    for user in open_users(service)? {
+        // A user with no blob of a credential's secret has no screen lock,
+        // and their own files open behind the storage hardware alone.
+        let shut = match protector(user)? {
+            Some(protector) => protector.lock.map(|lock| Closed { user, lock: lock.kind, made_up: made_up(user, &protector.id), why: None }),
+            None => None,
+        };
+        match shut {
+            Some(shut) => closed.push(shut),
+            None => {
+                let note = open_user_files(service, user, None, None)?;
+                if user == OWNER {
+                    owner = note;
+                }
+            }
+        }
+    }
+    Ok(Opening { mounted, closed: open_made_up(service, closed, &owner) })
+}
+
+/// Open the own files of `user` with what they typed at their screen lock
+/// and, where `user` is the owner, of each of `closed` whose credential
+/// the phone made up behind theirs; give those still closed.
+pub fn unlock(service: &KeyMint, closed: &[Closed], user: u32, credential: &[u8]) -> Result<Vec<Closed>> {
+    let note = open_user_files(service, user, Some(credential), None)?;
+    let rest = closed.iter().filter(|c| c.user != user).cloned().collect();
+    Ok(match user == OWNER {
+        true => open_made_up(service, rest, &note),
+        false => rest,
+    })
+}
+
+/// Open the own files of each of `closed` whose credential the phone made
+/// up, behind `owner`, the note the owner's own secret gave; give those
+/// still closed, a made-up one with why it did not open. Where the secure
+/// world wrote no note, none of them is tried and each is left with why.
+fn open_made_up(service: &KeyMint, closed: Vec<Closed>, owner: &Note) -> Vec<Closed> {
+    let Some(token) = &owner.token else {
+        return closed
+            .into_iter()
+            .map(|c| match c.made_up {
+                true => Closed { why: owner.refused.clone(), ..c },
+                false => c,
+            })
+            .collect();
+    };
+    closed
+        .into_iter()
+        .filter_map(|c| match c.made_up {
+            false => Some(c),
+            true => match open_user_files(service, c.user, None, Some(token)) {
+                Ok(_) => None,
+                Err(e) => Some(Closed { why: Some(format!("{e:#}")), ..c }),
+            },
+        })
+        .collect()
+}
+
+/// Whether the phone made up the credential of `user`, whose protector is
+/// `id`, keeping it behind the owner's.
+fn made_up(user: u32, id: &str) -> bool {
+    made_up_record(user, id).is_some()
+}
+
+/// Where the phone keeps the key for the files that are readable before
+/// anyone signs in, and what it says about how those files are encrypted.
+const SHARED_KEY: &str = "/data/unencrypted/key";
+const SHARED_NAME: &str = "/data/unencrypted/ref";
+const FILE_MODE: &str = "/data/unencrypted/mode";
+
+/// Where the phone keeps each user's own keys.
+const USER_KEYS: &str = "/data/misc/vold/user_keys";
+
+/// The key the phone keeps for the files that belong to no one user, as the
+/// storage hardware hands it over.
+pub fn shared_key(service: &KeyMint) -> Result<Vec<u8>> {
+    Ok(key_in(service, Path::new(SHARED_KEY))?.0)
+}
+
+/// A key the phone keeps in `dir`, as the storage hardware hands it over,
+/// and whether the hardware is what holds it — for trying it against the
+/// kernel by hand.
+pub fn key_in(service: &KeyMint, dir: &Path) -> Result<(Vec<u8>, bool)> {
+    let mode = std::fs::read_to_string(FILE_MODE).with_context(|| format!("read {FILE_MODE}"))?;
+    let wrapped = crate::fscrypt::hardware_wrapped(mode.trim());
+    Ok((hardware_key(service, dir, wrapped)?, wrapped))
+}
+
+/// Let in the key for the files that belong to no one user. Until it is
+/// in, most of what the data partition holds reads as scrambled names.
+fn open_shared(service: &KeyMint) -> Result<Vec<u8>> {
+    let mode = std::fs::read_to_string(FILE_MODE).with_context(|| format!("read {FILE_MODE}"))?;
+    let wrapped = crate::fscrypt::hardware_wrapped(mode.trim());
+    let raw = hardware_key(service, Path::new(SHARED_KEY), wrapped)?;
+    let recorded = crate::fscrypt::recorded_name(Path::new(SHARED_NAME))?;
+    let name = crate::fscrypt::add_key(Path::new(MOUNT), &raw, wrapped, Some(&recorded), crate::fscrypt::contents_mode(mode.trim()))?;
+    if name != recorded {
+        anyhow::bail!("the key in {SHARED_KEY} is not the one {SHARED_NAME} names");
+    }
+    Ok(name)
+}
+
+/// Mount the data partition as it is, for a phone whose files are encrypted
+/// one by one rather than the whole partition being wrapped in one key.
+fn mount_plainly(entries: &[Entry]) -> Result<()> {
+    let device = skyward_block::fstab::device(entries.first().context("the phone's table says nothing about /data")?)?;
+    // The table may name the partition once per filesystem it might hold,
+    // and only the partition knows which it was last written with.
+    let holds = skyward_block::probe::filesystem(Path::new(&device))?;
+    let entry = entries.iter().find(|e| holds.as_ref() == Some(&e.filesystem)).unwrap_or(&entries[0]);
+    std::fs::create_dir_all(MOUNT).with_context(|| format!("make {MOUNT}"))?;
+    mount::mount(Path::new(&device), Path::new(MOUNT), &entry.filesystem, &entry.options)
+}
+
+/// Which users the phone keeps keys for, in order.
+///
+/// A phone keeps a folder for each user under both of the places it may keep
+/// their keys, and **either may be the only one there**: a phone that keeps
+/// keys for a user's files before they sign in has one under `de`, and one
+/// whose user never had such files has none — and a folder whose own name
+/// cannot be read, because the key for it is kept inside it, is as good as
+/// absent. So both are read, neither is required, and the users found in
+/// either are the users there are.
+fn users() -> Result<Vec<u32>> {
+    let mut users: Vec<u32> = Vec::new();
+    // The phone writes down which users it has where it keeps them, in a
+    // folder of its own that the key for the whole partition opens: the
+    // folders of their keys are kept by those very keys, so reading them to
+    // find the users would need the users found first.
+    if let Ok(entries) = std::fs::read_dir("/data/system/users") {
+        for entry in entries.flatten() {
+            let Some(user) = entry.path().file_name().and_then(|n| n.to_str()).and_then(|n| n.parse::<u32>().ok()) else {
+                continue;
+            };
+            if !users.contains(&user) {
+                users.push(user);
+            }
+        }
+    }
+    for which in ["de", "ce"] {
+        let dir = Path::new(USER_KEYS).join(which);
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Some(user) = entry.path().file_name().and_then(|n| n.to_str()).and_then(|n| n.parse::<u32>().ok()) else {
+                continue;
+            };
+            if !users.contains(&user) {
+                users.push(user);
+            }
+        }
+    }
+    users.sort_unstable();
+    Ok(users)
+}
+
+/// The name a user's own key is known by, read off the folders it opens.
+///
+/// The phone keeps a word beside the key for the files that belong to no one
+/// user, and **none beside a user's own keys**: those are named by a word it
+/// chose when it made them, and nothing works that word out again — not the
+/// key's own hash, which is a different word. The folders themselves are the
+/// record, then: each says which key it is kept by, and the key that opens
+/// them is the one wanted.
+fn user_key_name(places: &[PathBuf]) -> Option<Vec<u8>> {
+    places.iter().find_map(|at| crate::fscrypt::policy_name(at).ok())
+}
+
+/// The folders a user's files that are readable before they sign in are
+/// kept in, any of which says which key they are kept by.
+fn de_places(user: u32) -> Vec<PathBuf> {
+    let n = user.to_string();
+    ["/data/misc_de", "/data/system_de", "/data/vendor_de"].iter().map(|at| Path::new(at).join(&n)).collect()
+}
+
+/// The folders a user's own files are kept in, any of which says which key
+/// they are kept by. The owner's own are kept straight under `/data` on this
+/// phone rather than in a folder of their own under `/data/user`.
+fn ce_places(user: u32) -> Vec<PathBuf> {
+    let n = user.to_string();
+    let mut places: Vec<PathBuf> = ["/data/user", "/data/system_ce", "/data/media"].iter().map(|at| Path::new(at).join(&n)).collect();
+    if user == OWNER {
+        places.insert(0, PathBuf::from("/data/data"));
+    }
+    places
+}
+
+/// Let in the keys for the files of each user that are readable before
+/// that user signs in, and give the users they belong to.
+fn open_users(service: &KeyMint) -> Result<Vec<u32>> {
+    let mode = std::fs::read_to_string(FILE_MODE).with_context(|| format!("read {FILE_MODE}"))?;
+    let wrapped = crate::fscrypt::hardware_wrapped(mode.trim());
+    let word = crate::fscrypt::contents_mode(mode.trim());
+    let users = users()?;
+    for user in &users {
+        let dir = Path::new(USER_KEYS).join("de").join(user.to_string());
+        let raw = hardware_key(service, &dir, wrapped)?;
+        // A key's name is the phone's own where it recorded one beside it,
+        // and otherwise the word the folders it opens are kept by.
+        let recorded = crate::fscrypt::recorded_name(&dir.join("ref")).ok().or_else(|| user_key_name(&de_places(*user)));
+        crate::fscrypt::add_key(Path::new(MOUNT), &raw, wrapped, recorded.as_deref(), word)?;
+    }
+    Ok(users)
+}
+
+/// Where a phone keeps what it needs to recover a user's own secret.
+const PROTECTORS: &str = "/data/system_de";
+
+/// Read what a user's own credential keeps their secret behind. A phone
+/// may keep more than one blob for a user: Android keeps one for each
+/// token some part of the phone was given to reach the secret with, and
+/// HyperOS, once the owner changes one screen lock for another with a
+/// fingerprint enrolled, keeps a second one for a while, so that the
+/// credential before can still be used. Which of them the user's current
+/// credential opens is the phone's own business, and it writes that down,
+/// so this reads it rather than guess.
+fn protector(user: u32) -> Result<Option<crate::user::Protector>> {
+    let dir = blobs(user);
+    // A user who has never set a screen lock has nothing here at all: no
+    // blob, because no credential was ever enrolled to guard one. Their own
+    // files are kept by the storage hardware alone, and that is a fact about
+    // the phone rather than a failure to read it.
+    if !dir.is_dir() {
+        return Ok(None);
+    }
+    let mut ids = Vec::new();
+    for entry in std::fs::read_dir(&dir).with_context(|| format!("read {}", dir.display()))? {
+        let path = entry.with_context(|| format!("read {}", dir.display()))?.path();
+        if path.extension().is_some_and(|e| e == "spblob") {
+            if let Some(id) = path.file_stem().and_then(|s| s.to_str()) {
+                ids.push(id.to_string());
+            }
+        }
+    }
+    if ids.is_empty() {
+        return Ok(None);
+    }
+    let id = match crate::locksettings::current_protector(Path::new(crate::locksettings::DATABASE), user)? {
+        Some(recorded) => {
+            anyhow::ensure!(
+                ids.contains(&recorded),
+                "the phone keeps user {user}'s secret behind the blob {recorded}, which is not among the {} in {}",
+                ids.len(),
+                dir.display()
+            );
+            recorded
+        }
+        // Where the phone records none, only a blob that is alone is
+        // beyond doubt the user's.
+        None => match &ids[..] {
+            [only] => only.clone(),
+            _ => anyhow::bail!(
+                "{} holds {} of the user's blobs, and the phone records none of them as the one the user's own credential opens",
+                dir.display(),
+                ids.len()
+            ),
+        },
+    };
+    // A user who has set a screen lock has what the phone recorded about
+    // it beside the blob; a user who has set none has nothing there.
+    let recorded = dir.join(format!("{id}.pwd"));
+    let lock = match recorded.exists() {
+        true => Some(crate::user::Lock::of(&std::fs::read(&recorded).with_context(|| format!("read {}", recorded.display()))?)?),
+        false => None,
+    };
+    // A phone with a weaver records the slot it keeps for the blob; any
+    // other keeps the bytes the blob is bound to beside it.
+    let slot = dir.join(format!("{id}.weaver"));
+    let bound = match slot.exists() {
+        true => Bound::Weaver(crate::user::weaver_slot(&std::fs::read(&slot).with_context(|| format!("read {}", slot.display()))?)?),
+        false => Bound::Secdiscardable(
+            std::fs::read(dir.join(format!("{id}.secdis"))).with_context(|| format!("read what the blob in {} is bound to", dir.display()))?,
+        ),
+    };
+    Ok(Some(crate::user::Protector {
+        blob: std::fs::read(dir.join(format!("{id}.spblob"))).with_context(|| format!("read the blob in {}", dir.display()))?,
+        bound,
+        id,
+        lock,
+    }))
+}
+
+/// Which of the secure world's slots a user's enrolment sits in. What the
+/// user types is enrolled a hundred thousand above their own number,
+/// keeping it apart from the enrolments made before phones kept
+/// credentials this way; the secret behind it is enrolled under the
+/// number itself.
+const TYPED_SLOT: u32 = 100_000;
+
+/// Whether the secure world recognises `typed` as the credential `user` set,
+/// enrolled under `slot`.
+///
+/// For telling a wrong credential from a wrong guess at what the phone keeps
+/// for it: the two answer the same way, and the difference is the whole of
+/// what a phone that will not open leaves to go on.
+pub fn credential_accepted(user: u32, typed: &[u8], slot: u32) -> Result<bool> {
+    let protector = protector(user)?.with_context(|| format!("user {user} keeps no blob of a credential's secret"))?;
+    let lock = protector.lock.as_ref().with_context(|| format!("user {user} has set no screen lock"))?;
+    let password = crate::user::gatekeeper_password(&lock.stretched(typed)?);
+    let binder = Binder::open()?;
+    let hardware = Binder::hardware()?;
+    let gatekeeper = Gatekeeper::open(&binder, &hardware)?;
+    Ok(gatekeeper.verify(slot, &lock.enrolled, &password).is_ok())
+}
+
+/// Every plausible way of turning what a user typed into the token the secure
+/// world checks, tried in turn, and which of them it took.
+///
+/// The word the phone writes beside the credential says how slow the stretch
+/// is meant to be, and there is more than one reading of those three numbers
+/// and of what goes into the hash after it. A phone that will not open says
+/// the same thing for all of them, so they are all tried and the one that
+/// answers is named.
+pub fn which_derivation(user: u32, typed: &[u8], slot: u32) -> Result<Vec<(String, bool)>> {
+    let protector = protector(user)?.with_context(|| format!("user {user} keeps no blob of a credential's secret"))?;
+    let lock = protector.lock.as_ref().with_context(|| format!("user {user} has set no screen lock"))?;
+    let [log_n, log_r, log_p] = lock.cost;
+    let mut tokens: Vec<(String, Vec<u8>)> = Vec::new();
+    for (cost, r, p) in
+        [("the numbers as Android reads them", 1u32 << log_r, 1u32 << log_p), ("the numbers as they are stored", u32::from(log_r), u32::from(log_p))]
+    {
+        let params = scrypt::Params::new(log_n, r, p, 32).map_err(|e| anyhow::anyhow!("the phone asks for stretching this code cannot do: {e}"))?;
+        let mut stretched = vec![0u8; 32];
+        scrypt::scrypt(typed, &lock.salt, &params, &mut stretched).map_err(|e| anyhow::anyhow!("stretch the credential: {e}"))?;
+        tokens.push((format!("{cost}, under the credential's own name"), crate::user::gatekeeper_password(&stretched)));
+        let mut with_salt = stretched.clone();
+        with_salt.extend_from_slice(&lock.salt);
+        tokens.push((format!("{cost}, with the salt after it"), crate::user::gatekeeper_password(&with_salt)));
+        let mut salt_first = lock.salt.clone();
+        salt_first.extend_from_slice(&stretched);
+        tokens.push((format!("{cost}, with the salt before it"), crate::user::gatekeeper_password(&salt_first)));
+    }
+    let binder = Binder::open()?;
+    let hardware = Binder::hardware()?;
+    let gatekeeper = Gatekeeper::open(&binder, &hardware)?;
+    // The blob the secure world is asked about: the one beside the
+    // credential, and — where this phone keeps its own way of these things —
+    // the one the blob's own directory names.
+    let mut handles: Vec<(&str, &[u8])> = vec![("the handle beside the credential", &lock.enrolled)];
+    let kept = std::fs::read(blobs(user).join(SECRET_HANDLE)).unwrap_or_default();
+    if !kept.is_empty() {
+        handles.push(("the handle the blob's directory names", &kept));
+    }
+    let mut said = Vec::new();
+    for (which, handle) in handles {
+        for (how, token) in &tokens {
+            let took = gatekeeper.verify(slot, handle, token).is_ok();
+            said.push((format!("{how}, against {which}"), took));
+        }
+    }
+    Ok(said)
+}
+
+/// What the phone calls the enrolment of a user's own secret, among the
+/// blobs it keeps for that user.
+const BLOBS: &str = "spblob";
+const SECRET_HANDLE: &str = "0000000000000000.handle";
+
+/// Where a user's blobs are.
+fn blobs(user: u32) -> PathBuf {
+    Path::new(PROTECTORS).join(user.to_string()).join(BLOBS)
+}
+
+/// Where a phone keeps the credential it made up itself for a user whose
+/// screen lock is the owner's. The file holds a nonce and then the
+/// credential, encrypted under a key the owner's own secret guards.
+const MADE_UP: &str = "/data/system/users";
+const MADE_UP_FILE: &str = "gatekeeper.profile.key";
+
+/// The name the key service keeps that key under, the user's number after
+/// it.
+const MADE_UP_KEY: &str = "profile_key_name_decrypt_";
+
+/// HyperOS keeps the file beside the blob of the user's protector instead,
+/// named after the protector with this ending, and puts the protector's
+/// name after the user's number in the key's name too.
+const MADE_UP_BESIDE_BLOB: &str = "profile_pwd";
+
+/// The file holding the credential the phone made up for `user`, whose
+/// protector is `id`, and the name of the key it is encrypted under: where
+/// Android keeps them, or where HyperOS does. `None` where it made none up.
+fn made_up_record(user: u32, id: &str) -> Option<(PathBuf, String)> {
+    let android = Path::new(MADE_UP).join(user.to_string()).join(MADE_UP_FILE);
+    if android.is_file() {
+        return Some((android, format!("{MADE_UP_KEY}{user}")));
+    }
+    let hyperos = blobs(user).join(format!("{id}.{MADE_UP_BESIDE_BLOB}"));
+    hyperos.is_file().then(|| (hyperos, format!("{MADE_UP_KEY}{user}.{id}")))
+}
+
+/// The credential a phone made up for `user`, whose protector is `id`,
+/// where it made one up. A phone does this for the users it keeps beside
+/// the owner's own, such as the one that holds a second copy of an app:
+/// nobody ever types their credential, so the phone writes one down for
+/// itself and keeps it behind the owner's. `owner` is the note the owner's
+/// credential gave.
+fn made_up_credential(service: &KeyMint, user: u32, id: &str, owner: Option<&Token>) -> Result<Option<Vec<u8>>> {
+    let Some((file, alias)) = made_up_record(user, id) else {
+        return Ok(None);
+    };
+    let stored = std::fs::read(&file).with_context(|| format!("read {}", file.display()))?;
+    if stored.len() < NONCE_BYTES + TAG_BYTES {
+        anyhow::bail!("{} is {} bytes, too few to hold a credential", file.display(), stored.len());
+    }
+    let (nonce, body) = stored.split_at(NONCE_BYTES);
+    let held = crate::keystore2::key_blob(Path::new(crate::keystore2::DATABASE), &alias)?;
+    let credential = service
+        .gcm_decrypt(&held, &[], nonce, body, owner)
+        .with_context(|| format!("open the credential the phone made up for user {user}, which is kept behind the owner's own"))?;
+    Ok(Some(credential))
+}
+
+/// How long the nonce and the check are on everything the key service
+/// encrypts.
+const NONCE_BYTES: usize = 12;
+const TAG_BYTES: usize = 16;
+
+/// Let in the key for a user's own files, and give the note the secure
+/// world wrote for the secret behind their credential, which is what the
+/// keys the phone keeps for them are guarded by. `credential` is what the
+/// user would type at their screen lock; a user who has set none needs
+/// none, and a user the phone made one up for needs `owner`, the note the
+/// owner's own secret gave. The owner's files open, their shared storage
+/// shows at /sdcard.
+fn open_user_files(service: &KeyMint, user: u32, credential: Option<&[u8]>, owner: Option<&Token>) -> Result<Note> {
+    let mode = std::fs::read_to_string(FILE_MODE).with_context(|| format!("read {FILE_MODE}"))?;
+    let wrapped = crate::fscrypt::hardware_wrapped(mode.trim());
+    let dir = Path::new(USER_KEYS).join("ce").join(user.to_string()).join("current");
+    let stored = StoredKey::load(&dir).with_context(|| format!("read the key in {}", dir.display()))?;
+    // **A phone with no screen lock keeps a user's files the way it keeps its
+    // own**: the storage hardware holds the key and nothing a user knows is
+    // needed, so it comes apart by itself. That is this phone — it has no
+    // screen lock, no blob of a credential's secret anywhere, and a CE key
+    // the hardware opens. Only a phone with a credential to bind the key to
+    // wraps it in software instead, and then the credential has to be
+    // stretched and checked before the key will come.
+    let (raw, note) = match stored.unwrap(Unwrap::Hardware(service)) {
+        Ok(raw) => (raw, Note::default()),
+        Err(alone) => {
+            let (file_secret, note) = user_file_secret(service, user, credential, owner)?;
+            let raw = stored
+                .unwrap(Unwrap::<KeyMint>::Secret(&file_secret))
+                .with_context(|| format!("unwrap the key in {} — and by the storage hardware alone: {alone:#}", dir.display()))?;
+            (raw, note)
+        }
+    };
+    let raw = match wrapped {
+        true => service.ephemeral_storage_key(&raw).with_context(|| format!("make the key in {} usable now", dir.display()))?,
+        false => raw,
+    };
+    // The name this key goes in under is the one the user's own folders are
+    // kept by, which they say themselves: the phone keeps no word beside a
+    // user's key, and it is not named after itself.
+    let recorded = crate::fscrypt::recorded_name(&dir.join("ref")).ok().or_else(|| user_key_name(&ce_places(user)));
+    crate::fscrypt::add_key(Path::new(MOUNT), &raw, wrapped, recorded.as_deref(), crate::fscrypt::contents_mode(mode.trim()))?;
+    if user == OWNER {
+        show_owner_storage()?;
+    }
+    Ok(note)
+}
+
+/// What a user's own key is wrapped with, from what they typed at their
+/// screen lock, and the note the secure world wrote for the secret behind
+/// it, which is what the credentials the phone made up for other users are
+/// kept behind.
+fn user_file_secret(service: &KeyMint, user: u32, credential: Option<&[u8]>, owner: Option<&Token>) -> Result<(Vec<u8>, Note)> {
+    let protector = protector(user)?
+        .with_context(|| format!("user {user} keeps no blob of a credential's secret, and the storage hardware will not open their key by itself"))?;
+    let stretched = match &protector.lock {
+        Some(lock) => {
+            let typed = match made_up_credential(service, user, &protector.id, owner)? {
+                Some(made_up) => made_up,
+                None => credential.with_context(|| format!("user {user} has set a screen lock, and their files do not open without it"))?.to_vec(),
+            };
+            lock.stretched(&typed).context("stretch the credential")?
+        }
+        None => crate::user::stretched_without_credential(),
+    };
+    let (secret, note) = match (&protector.bound, &protector.lock) {
+        // The weaver checks the credential itself, and gives back the value
+        // the secret is bound to only for the right one. The key holding
+        // the secret is then guarded by nothing else.
+        (Bound::Weaver(slot), _) => {
+            let binder = Binder::open()?;
+            let weaver = Weaver::open(&binder)?;
+            let key = crate::user::weaver_key(&stretched, weaver.config()?.key_bytes)?;
+            let value = weaver.read(*slot, &key)?;
+            (crate::user::weaver_protector_secret(&stretched, &value), None)
+        }
+        // The key holding this user's secret is guarded by the screen lock,
+        // so the secure world has to be shown the credential itself before
+        // it will use that key.
+        (Bound::Secdiscardable(secdiscardable), Some(lock)) => {
+            let (binder, hardware) = (Binder::open()?, Binder::hardware()?);
+            let note = Gatekeeper::open(&binder, &hardware)?.verify(TYPED_SLOT + user, &lock.enrolled, &crate::user::gatekeeper_password(&stretched))?;
+            (crate::user::protector_secret(&stretched, secdiscardable), Some(note))
+        }
+        (Bound::Secdiscardable(secdiscardable), None) => (crate::user::protector_secret(&stretched, secdiscardable), None),
+    };
+    let held = crate::keystore2::key_blob(Path::new(crate::keystore2::DATABASE), &protector.key_alias())?;
+    let content = crate::user::content(&protector.blob)?;
+    if content.len() < NONCE_BYTES + TAG_BYTES {
+        anyhow::bail!("the user's blob is too short to hold anything");
+    }
+    let (nonce, body) = content.split_at(NONCE_BYTES);
+    let inner = service.gcm_decrypt(&held, &[], nonce, body, note.as_ref()).context("open what the secure world holds the user's blob closed with")?;
+    let synthetic_password = crate::user::open_inner(&secret, &inner)?;
+    let file_secret = crate::user::file_secret(&synthetic_password);
+    let note = secret_note(user, &synthetic_password)?;
+    Ok((file_secret, note))
+}
+
+/// What the secure world wrote for a user's own secret, which is what the
+/// credentials the phone made up for other users are kept behind. A user
+/// whose secret the secure world knows nothing about has none, and so has
+/// one whose secure world would write none; the user's own files are open
+/// either way, and only the users kept behind this one stay closed.
+#[derive(Debug, Default)]
+struct Note {
+    token: Option<Token>,
+    /// Why the secure world wrote none, where it was asked and would not.
+    refused: Option<String>,
+}
+
+/// Have the secure world check the user's own secret, so the keys the
+/// phone keeps for that user can be used.
+fn secret_note(user: u32, synthetic_password: &[u8]) -> Result<Note> {
+    let handle = blobs(user).join(SECRET_HANDLE);
+    if !handle.is_file() {
+        return Ok(Note::default());
+    }
+    let enrolled = std::fs::read(&handle).with_context(|| format!("read {}", handle.display()))?;
+    let (binder, hardware) = (Binder::open()?, Binder::hardware()?);
+    let password = crate::user::secret_gatekeeper_password(synthetic_password);
+    let asked = Gatekeeper::open(&binder, &hardware)
+        .and_then(|gatekeeper| gatekeeper.verify(user, &enrolled, &password))
+        .with_context(|| format!("have the secure world check the secret behind user {user}'s credential"));
+    Ok(match asked {
+        Ok(token) => Note { token: Some(token), refused: None },
+        Err(e) => Note { token: None, refused: Some(format!("{e:#}")) },
+    })
+}
+
+/// Build the device-mapper target that reads the partition through the
+/// storage hardware's decryption.
+pub fn target(device: &str, sectors: u64, key: &[u8], encryption: &Encryption) -> Target {
+    Target::DefaultKey {
+        sectors: sectors - sectors % SECTORS_PER_UNIT,
+        device: device.to_string(),
+        cipher: encryption.cipher.clone(),
+        key: key.iter().map(|b| format!("{b:02x}")).collect(),
+        wrapped: encryption.wrapped,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(extras: &str) -> Entry {
+        Entry {
+            device: "/dev/block/bootdevice/by-name/userdata".into(),
+            mount_point: MOUNT.into(),
+            filesystem: "f2fs".into(),
+            options: vec!["noatime".into(), "inlinecrypt".into()],
+            extras: extras.split(',').map(str::to_string).collect(),
+        }
+    }
+
+    #[test]
+    fn the_phones_own_words_for_the_cipher_become_the_kernels() {
+        let e = entry("metadata_encryption=aes-256-xts:wrappedkey_v0,keydirectory=/metadata/vold/metadata_encryption");
+        assert_eq!(Encryption::of(&e).unwrap(), Encryption { cipher: "aes-xts-plain64".into(), wrapped: true });
+        let plain = entry("metadata_encryption=adiantum");
+        assert_eq!(Encryption::of(&plain).unwrap(), Encryption { cipher: "xchacha12,aes-adiantum-plain64".into(), wrapped: false });
+    }
+
+    #[test]
+    fn a_cipher_or_a_key_the_phone_does_not_name_is_an_error() {
+        assert!(Encryption::of(&entry("quota")).is_err());
+        assert!(Encryption::of(&entry("metadata_encryption=rot13")).is_err());
+        assert!(key_dir(&entry("quota")).is_err());
+    }
+
+    #[test]
+    fn the_key_is_in_a_directory_under_the_one_the_phone_names() {
+        let e = entry("keydirectory=/metadata/vold/metadata_encryption");
+        assert_eq!(key_dir(&e).unwrap(), Path::new("/metadata/vold/metadata_encryption/key"));
+    }
+
+    #[test]
+    fn the_partition_is_mapped_in_whole_units_of_the_hardwares_reads() {
+        let e = Encryption { cipher: "aes-xts-plain64".into(), wrapped: true };
+        let t = target("/dev/block/by-name/userdata", 969_825_751, &[0xAB, 0x01], &e);
+        let Target::DefaultKey { sectors, key, cipher, device, wrapped } = t else { panic!("a decrypting target") };
+        assert_eq!(sectors, 969_825_744, "a whole number of 4096-byte units");
+        assert_eq!(key, "ab01");
+        assert_eq!(cipher, "aes-xts-plain64");
+        assert_eq!(device, "/dev/block/by-name/userdata");
+        assert!(wrapped);
+    }
+}

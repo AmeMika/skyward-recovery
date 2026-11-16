@@ -1,0 +1,63 @@
+# Unified Mi-Thorium MSM8917/MSM8937/MSM8940 recovery, kernel 4.19.
+# Identity is filled from /sys/xiaomi-msm8937-mach by the startup wrapper.
+[device]
+codename = "mi8953_4_19"
+brand = "Xiaomi"
+model = "Mi-Titanium 4.19"
+maintainer = "ast-renz"
+ab = false
+
+[recovery]
+language = "en"
+open_data = true
+
+[display]
+# The framebuffer supplies width and height; use a roomier 267 DPI layout.
+density = 267
+status_inset_dp = 16
+
+[haptics]
+timed = "/sys/class/leds/vibrator"
+drive = 60
+strength = { lightest = 0.5, strongest = 1.0 }
+
+[sdcard]
+disk = "mmcblk1"
+mount = "/sdcard1"
+
+[backup]
+efs = ["modemst1", "modemst2", "fsg", "fsc"]
+# Let the runtime fstab select physical or logical system/vendor partitions.
+
+[wipe]
+formats = ["data", "cache", "metadata", "system", "vendor"]
+
+# Data and metadata retain the base's 4.19 FBE-v2/inlinecrypt entries.
+# System/vendor entries are selected at boot by the base's merge-fstab.sh.
+[[fstab]]
+device = "/dev/block/bootdevice/by-name/cache"
+mount_point = "/cache"
+filesystem = "ext4"
+options = "nosuid,nodev,noatime,discard"
+extras = "wait,check,formattable"
+
+[[fstab]]
+device = "/dev/block/bootdevice/by-name/cache"
+mount_point = "/cache"
+filesystem = "f2fs"
+options = "nosuid,nodev,noatime,discard"
+extras = "wait,check,formattable"
+
+[[fstab]]
+device = "/dev/block/bootdevice/by-name/persist"
+mount_point = "/persist"
+filesystem = "ext4"
+options = "ro,nosuid,nodev,noatime"
+extras = "wait"
+
+[[fstab]]
+device = "/dev/block/bootdevice/by-name/modem"
+mount_point = "/firmware"
+filesystem = "vfat"
+options = "ro"
+extras = "wait"
