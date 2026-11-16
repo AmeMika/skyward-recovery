@@ -33,7 +33,9 @@ jobs:
           curl --fail --location --proto '=https' --proto-redir '=https' "$BASE_URL" -o target/base/recovery.img
           printf '%s  %s\n' "$BASE_SHA256" target/base/recovery.img | sha256sum --check
       - name: Build and pack Skyward
-        run: tools/build-mi8953-4.19.sh target/base/recovery.img out/skyward-mi8953_4_19.img
+        run: |
+          mkdir -p out
+          bash tools/build-mi8953-4.19.sh target/base/recovery.img out/skyward-mi8953_4_19.img
       - name: Create the download
         working-directory: out
         run: |
