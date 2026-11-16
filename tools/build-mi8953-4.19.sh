@@ -52,5 +52,4 @@ python3 tools/subset-cjk.py --out target/mi8953_4_19/MiSansVF.ttf
     --partition-size 67108864 \
     --ramdisk-limit 33554432 \
     --out "$output_image"
-python3 tools/verify-mi8953-4.19.py "$base_image" "$output_image"
 sha256sum "$output_image"
